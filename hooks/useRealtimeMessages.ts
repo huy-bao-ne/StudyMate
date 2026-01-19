@@ -1,0 +1,736 @@
+'use client'
+
+import { useEffect, useState } from 'react'
+import { usePusher } from './usePusher'
+import { cacheManager } from '@/lib/cache/CacheManager'
+import { getOptimisticUpdateManager } from '@/lib/optimistic/OptimisticUpdateManager'
+
+export interface MessageReaction {
+  emoji: string
+  users: {
+    id: string
+    firstName: string
+    lastName: string
+  }[]
+  count: number
+}
+
+export interface Message {
+  id: string
+  senderId: string
+  receiverId?: string
+  roomId?: string
+  type: 'TEXT' | 'FILE' | 'VOICE' | 'VIDEO'
+  content: string
+  fileUrl?: string
+  fileName?: string
+  fileSize?: number
+  replyToId?: string
+  isEdited?: boolean
+  editedAt?: string
+  isRead?: boolean
+  readAt?: string
+  createdAt: string
+  updatedAt: string
+  sender: {
+    id: string
+    firstName: string
+    lastName: string
+    avatar?: string
+  }
+  replyTo?: Message
+  reactions?: MessageReaction[]
+
+  // Optimistic update metadata
+  _optimistic?: boolean
+  _operationId?: string
+  _status?: 'pending' | 'confirmed' | 'failed'
+}
+
+interface UseRealtimeMessagesProps {
+  chatId: string
+  chatType: 'private' | 'room'
+  userId: string
+}
+
+interface TypingUser {
+  userId: string
+  userName: string
+}
+
+export function useRealtimeMessages({ chatId, chatType, userId }: UseRealtimeMessagesProps) {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [isInitialLoading, setIsInitialLoading] = useState(true)
+  const [isFetching, setIsFetching] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [typingUsers, setTypingUsers] = useState<TypingUser[]>([])
+
+  // Helper function to add conversationId to message for cache
+  const addConversationIdToMessage = (message: Message, conversationId: string): any => {
+    const messageWithConversation = {
+      ...message,
+      conversationId,
+      replyTo: message.replyTo ? {
+        ...message.replyTo,
+        conversationId
+      } : undefined
+    }
+    return messageWithConversation
+  }
+
+  // Get channel name for Pusher (for private chats)
+  const getChannelName = () => {
+    if (chatType === 'private') {
+      const sortedIds = [userId, chatId].sort()
+      return `private-chat-${sortedIds[0]}-${sortedIds[1]}`
+    }
+    return `private-room-${chatId}`
+  }
+
+  // Listen for new messages, typing events and read receipts via Pusher
+  usePusher({
+    channelName: getChannelName(),
+    enabled: chatType === 'private',
+    events: {
+      'new-message': async (message: Message) => {
+        setMessages(prev => {
+          // Avoid duplicates
+          if (prev.find(m => m.id === message.id)) return prev
+          return [...prev, message].sort((a, b) =>
+            new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+          )
+        })
+
+        // Update IndexedDB cache with new message
+        try {
+          await cacheManager.addMessage(addConversationIdToMessage(message, chatId))
+        } catch (error) {
+          console.error('Failed to cache new message:', error)
+        }
+      },
+      'typing-start': (data: TypingUser) => {
+        // Don't show typing indicator for current user
+        if (data.userId === userId) return
+
+        setTypingUsers(prev => {
+          // Add user if not already in list
+          if (!prev.find(u => u.userId === data.userId)) {
+            return [...prev, data]
+          }
+          return prev
+        })
+      },
+      'typing-stop': (data: TypingUser) => {
+        setTypingUsers(prev => prev.filter(u => u.userId !== data.userId))
+      },
+      'message-read': (data: { messageId: string; readBy: string; readAt: string }) => {
+        // Update message read status in local state
+        setMessages(prev => prev.map(msg =>
+          msg.id === data.messageId
+            ? { ...msg, isRead: true, readAt: data.readAt }
+            : msg
+        ))
+      },
+      'message-edited': async (updatedMessage: Message) => {
+        // Update message in local state
+        setMessages(prev => prev.map(msg =>
+          msg.id === updatedMessage.id ? updatedMessage : msg
+        ))
+
+        // Update IndexedDB cache
+        try {
+          await cacheManager.updateMessage(updatedMessage.id, {
+            content: updatedMessage.content,
+            isEdited: updatedMessage.isEdited,
+            editedAt: updatedMessage.editedAt,
+            updatedAt: updatedMessage.updatedAt
+          })
+        } catch (error) {
+          console.error('Failed to update cached message:', error)
+        }
+      },
+      'message-deleted': async (data: { messageId: string }) => {
+        // Remove message from local state
+        setMessages(prev => prev.filter(msg => msg.id !== data.messageId))
+
+        // Remove from IndexedDB cache
+        try {
+          await cacheManager.deleteMessage(data.messageId)
+        } catch (error) {
+          console.error('Failed to delete cached message:', error)
+        }
+      },
+      'reaction-added': async (data: { messageId: string; userId: string; emoji: string; reactions: MessageReaction[] }) => {
+        // Update message reactions in local state
+        setMessages(prev => prev.map(msg =>
+          msg.id === data.messageId
+            ? { ...msg, reactions: data.reactions }
+            : msg
+        ))
+
+        // Update IndexedDB cache
+        try {
+          await cacheManager.updateMessage(data.messageId, {
+            reactions: data.reactions
+          })
+        } catch (error) {
+          console.error('Failed to update cached message reactions:', error)
+        }
+      },
+      'reaction-removed': async (data: { messageId: string; userId: string; emoji: string; reactions: MessageReaction[] }) => {
+        // Update message reactions in local state
+        setMessages(prev => prev.map(msg =>
+          msg.id === data.messageId
+            ? { ...msg, reactions: data.reactions }
+            : msg
+        ))
+
+        // Update IndexedDB cache
+        try {
+          await cacheManager.updateMessage(data.messageId, {
+            reactions: data.reactions
+          })
+        } catch (error) {
+          console.error('Failed to update cached message reactions:', error)
+        }
+      }
+    }
+  })
+
+  // Send typing start event
+  const sendTypingStart = async () => {
+    if (chatType !== 'private') return
+
+    try {
+      // Trigger typing-start event via client event (for Pusher)
+      await fetch('/api/messages/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          receiverId: chatId,
+          event: 'typing-start'
+        })
+      })
+    } catch (err) {
+      console.error('Failed to send typing-start event:', err)
+    }
+  }
+
+  // Send typing stop event
+  const sendTypingStop = async () => {
+    if (chatType !== 'private') return
+
+    try {
+      // Trigger typing-stop event via client event (for Pusher)
+      await fetch('/api/messages/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          receiverId: chatId,
+          event: 'typing-stop'
+        })
+      })
+    } catch (err) {
+      console.error('Failed to send typing-stop event:', err)
+    }
+  }
+
+  // Fetch initial messages with IndexedDB cache-first strategy
+  useEffect(() => {
+    const fetchMessages = async () => {
+      try {
+        // Step 1: Read from IndexedDB cache first (instant display within 16ms)
+        const cachedMessages = await cacheManager.getMessages(chatId, 100)
+
+        if (cachedMessages.length > 0) {
+          // Display cached messages immediately
+          setMessages(cachedMessages)
+          // Keep isInitialLoading true until API call completes
+        }
+        // If no cache, isInitialLoading stays true and skeleton will show
+
+        // Step 2: Fetch fresh messages from API in background
+        setIsFetching(true)
+        const endpoint = chatType === 'private'
+          ? `/api/messages/private?chatId=${chatId}`
+          : `/api/messages/room?roomId=${chatId}`
+
+        const response = await fetch(endpoint)
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch messages')
+        }
+
+        const data = await response.json()
+        const freshMessages = data.messages || []
+
+        // Step 3: Update UI with fresh data
+        setMessages(freshMessages)
+
+        // Step 4: Update IndexedDB cache with fresh data
+        if (chatType === 'private' && freshMessages.length > 0) {
+          // Clear old messages for this conversation first
+          const existingMessages = await cacheManager.getMessages(chatId)
+          await Promise.all(
+            existingMessages.map(msg => cacheManager.deleteMessage(msg.id))
+          )
+
+          // Add fresh messages to cache
+          await Promise.all(
+            freshMessages.map((msg: Message) =>
+              cacheManager.addMessage(addConversationIdToMessage(msg, chatId))
+            )
+          )
+        }
+      } catch (err) {
+        console.error('Error fetching messages:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load messages')
+
+        // Keep cached messages if available, don't fallback to mock data
+        const cachedMessages = await cacheManager.getMessages(chatId, 100)
+        if (cachedMessages.length > 0) {
+          setMessages(cachedMessages)
+        }
+        // If no cache and error, show error state (no mock data)
+      } finally {
+        setIsInitialLoading(false)
+        setIsFetching(false)
+      }
+    }
+
+    if (chatId && userId) {
+      fetchMessages()
+    }
+  }, [chatId, chatType, userId])
+
+
+
+  const sendMessage = async (
+    content: string,
+    type: 'TEXT' | 'FILE' = 'TEXT',
+    replyToId?: string,
+    fileData?: any,
+    isReceiverViewing = false,
+    currentUserInfo?: { id: string; firstName: string; lastName: string; avatar?: string }
+  ) => {
+    // Get optimistic update manager
+    const optimisticManager = getOptimisticUpdateManager(cacheManager)
+
+    let operationId: string | null = null
+
+    try {
+      // Create optimistic message for immediate display
+      if (currentUserInfo && chatType === 'private') {
+        const optimisticMessage = optimisticManager.createOptimisticMessage(
+          content,
+          chatId,
+          currentUserInfo.id,
+          currentUserInfo,
+          type
+        )
+
+        operationId = optimisticMessage._operationId
+
+        // Add to local state immediately
+        setMessages(prev => {
+          // Check if message already exists
+          if (prev.find(m => m.id === optimisticMessage.id)) return prev
+          return [...prev, optimisticMessage].sort((a, b) =>
+            new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+          )
+        })
+
+        // Store in IndexedDB with optimistic flag
+        try {
+          await cacheManager.addMessage(addConversationIdToMessage(optimisticMessage, chatId))
+        } catch (cacheError) {
+          console.error('Failed to cache optimistic message:', cacheError)
+          // Continue with API call even if cache fails
+        }
+      }
+
+      // Send message via API in background
+      if (chatType === 'private') {
+        const response = await fetch('/api/messages/private', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            receiverId: chatId,
+            content,
+            type,
+            replyToId,
+            isReceiverViewing,
+            ...fileData
+          })
+        })
+
+        if (!response.ok) {
+          throw new Error('Failed to send message via API')
+        }
+
+        const data = await response.json()
+
+        // Confirm optimistic update with server data
+        if (operationId) {
+          await optimisticManager.confirm(operationId, data.message)
+
+          // Update local state to replace temp message with server message
+          setMessages(prev => prev.map(msg => {
+            if (msg.id === operationId || msg._operationId === operationId) {
+              // Remove optimistic flags
+              const { _optimistic, _operationId: _, _status, ...cleanMessage } = data.message
+              return cleanMessage
+            }
+            return msg
+          }))
+        } else {
+          // No optimistic update, just add the message
+          setMessages(prev => {
+            if (prev.find(m => m.id === data.message.id)) return prev
+            return [...prev, data.message].sort((a, b) =>
+              new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+            )
+          })
+        }
+
+        return data.message
+      } else {
+        // For room messages, use API (no optimistic updates for rooms yet)
+        const response = await fetch('/api/messages/room', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            roomId: chatId,
+            content,
+            type,
+            ...fileData
+          })
+        })
+
+        if (!response.ok) {
+          throw new Error('Failed to send message')
+        }
+
+        const data = await response.json()
+        return data.message
+      }
+    } catch (err) {
+      // Handle failure - mark optimistic message as failed
+      if (operationId) {
+        await optimisticManager.fail(operationId, err as Error)
+
+        // Update local state to show failed status
+        setMessages(prev => prev.map(msg => {
+          if (msg.id === operationId || msg._operationId === operationId) {
+            return { ...msg, _status: 'failed' as const }
+          }
+          return msg
+        }))
+      }
+
+      throw err
+    }
+  }
+
+  const editMessage = async (messageId: string, newContent: string) => {
+    try {
+      // Optimistically update the message in local state
+      setMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? { ...msg, content: newContent, isEdited: true, editedAt: new Date().toISOString() }
+          : msg
+      ))
+
+      // Update cache optimistically
+      try {
+        await cacheManager.updateMessage(messageId, {
+          content: newContent,
+          isEdited: true,
+          editedAt: new Date().toISOString()
+        })
+      } catch (cacheError) {
+        console.error('Failed to update cache:', cacheError)
+      }
+
+      const endpoint = chatType === 'private'
+        ? `/api/messages/private/${messageId}`
+        : `/api/messages/room/${messageId}`
+
+      const response = await fetch(endpoint, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: newContent })
+      })
+
+      if (!response.ok) {
+        // Rollback on failure - fetch the original message
+        const originalMsg = messages.find(m => m.id === messageId)
+        if (originalMsg) {
+          setMessages(prev => prev.map(msg =>
+            msg.id === messageId ? originalMsg : msg
+          ))
+          await cacheManager.updateMessage(messageId, {
+            content: originalMsg.content,
+            isEdited: originalMsg.isEdited,
+            editedAt: originalMsg.editedAt
+          })
+        }
+        throw new Error('Failed to edit message')
+      }
+
+      const data = await response.json()
+
+      // Update with server response
+      setMessages(prev => prev.map(msg =>
+        msg.id === messageId ? data.message : msg
+      ))
+
+      // Update cache with server data
+      await cacheManager.updateMessage(messageId, {
+        content: data.message.content,
+        isEdited: data.message.isEdited,
+        editedAt: data.message.editedAt,
+        updatedAt: data.message.updatedAt
+      })
+    } catch (err) {
+      throw err
+    }
+  }
+
+  const deleteMessage = async (messageId: string) => {
+    // Store the original message for rollback
+    const originalMessage = messages.find(m => m.id === messageId)
+
+    if (!originalMessage) {
+      throw new Error('Message not found')
+    }
+
+    try {
+      // Optimistically remove the message from local state
+      setMessages(prev => prev.filter(msg => msg.id !== messageId))
+
+      // Remove from IndexedDB cache immediately
+      try {
+        await cacheManager.deleteMessage(messageId)
+      } catch (cacheError) {
+        console.error('Failed to delete from cache:', cacheError)
+      }
+
+      const endpoint = chatType === 'private'
+        ? `/api/messages/private/${messageId}`
+        : `/api/messages/room/${messageId}`
+
+      const response = await fetch(endpoint, {
+        method: 'DELETE'
+      })
+
+      if (!response.ok) {
+        // Rollback on API failure
+        setMessages(prev => [...prev, originalMessage].sort((a, b) =>
+          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        ))
+
+        // Restore to cache
+        await cacheManager.addMessage(addConversationIdToMessage(originalMessage, chatId))
+
+        throw new Error('Failed to delete message')
+      }
+    } catch (err) {
+      throw err
+    }
+  }
+
+  const markMessageAsRead = async (messageId: string) => {
+    try {
+      if (chatType !== 'private') return
+
+      const response = await fetch(`/api/messages/private/${messageId}/read`, {
+        method: 'PATCH'
+      })
+
+      if (!response.ok) throw new Error('Failed to mark message as read')
+
+      const data = await response.json()
+
+      // Update local state
+      setMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? { ...msg, isRead: true, readAt: data.message.readAt }
+          : msg
+      ))
+    } catch (err) {
+      console.error('Failed to mark message as read:', err)
+    }
+  }
+
+  const retryMessage = async (operationId: string, currentUserInfo?: { id: string; firstName: string; lastName: string; avatar?: string }) => {
+    const optimisticManager = getOptimisticUpdateManager(cacheManager)
+
+    // Get the operation details
+    const operation = optimisticManager.getOperation(operationId)
+    if (!operation) {
+      console.error('Operation not found:', operationId)
+      return
+    }
+
+    // Retry the operation
+    const retriedOperation = await optimisticManager.retry(operationId)
+    if (!retriedOperation) {
+      console.error('Failed to retry operation:', operationId)
+      return
+    }
+
+    // Update UI to show pending status
+    setMessages(prev => prev.map(msg => {
+      if (msg.id === operationId || msg._operationId === operationId) {
+        return { ...msg, _status: 'pending' as const }
+      }
+      return msg
+    }))
+
+    // Retry sending the message
+    try {
+      await sendMessage(
+        retriedOperation.content || '',
+        'TEXT',
+        undefined, // replyToId
+        undefined, // fileData
+        false, // isReceiverViewing
+        currentUserInfo
+      )
+    } catch (err) {
+      console.error('Retry failed:', err)
+    }
+  }
+
+  const cancelMessage = async (operationId: string) => {
+    const optimisticManager = getOptimisticUpdateManager(cacheManager)
+
+    // Rollback the operation
+    await optimisticManager.rollback(operationId)
+
+    // Remove message from local state
+    setMessages(prev => prev.filter(msg =>
+      msg.id !== operationId && msg._operationId !== operationId
+    ))
+  }
+
+  const addReaction = async (messageId: string, emoji: string, currentUserInfo?: { id: string; firstName: string; lastName: string }) => {
+    if (chatType !== 'private') return
+
+    try {
+
+
+      // Optimistically update the UI for instant feedback
+      setMessages(prev => prev.map(msg => {
+        if (msg.id !== messageId) return msg
+
+        const reactions = msg.reactions || []
+        const existingReaction = reactions.find(r => r.emoji === emoji)
+
+        if (existingReaction) {
+          // Check if user already reacted
+          const hasUserReacted = existingReaction.users.some(u => u.id === currentUserInfo?.id)
+
+          if (hasUserReacted) {
+            // Remove user's reaction
+            const updatedUsers = existingReaction.users.filter(u => u.id !== currentUserInfo?.id)
+            if (updatedUsers.length === 0) {
+              // Remove the reaction entirely if no users left
+              return {
+                ...msg,
+                reactions: reactions.filter(r => r.emoji !== emoji)
+              }
+            }
+            return {
+              ...msg,
+              reactions: reactions.map(r =>
+                r.emoji === emoji
+                  ? { ...r, users: updatedUsers, count: updatedUsers.length }
+                  : r
+              )
+            }
+          } else {
+            // Add user to existing reaction
+            return {
+              ...msg,
+              reactions: reactions.map(r =>
+                r.emoji === emoji
+                  ? {
+                    ...r,
+                    users: [...r.users, { id: currentUserInfo!.id, firstName: currentUserInfo!.firstName, lastName: currentUserInfo!.lastName }],
+                    count: r.count + 1
+                  }
+                  : r
+              )
+            }
+          }
+        } else {
+          // Add new reaction
+          return {
+            ...msg,
+            reactions: [
+              ...reactions,
+              {
+                emoji,
+                users: [{ id: currentUserInfo!.id, firstName: currentUserInfo!.firstName, lastName: currentUserInfo!.lastName }],
+                count: 1
+              }
+            ]
+          }
+        }
+      }))
+
+      // Send API request in background
+      const response = await fetch(`/api/messages/${messageId}/reactions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emoji })
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(errorData.error || 'Failed to add reaction')
+      }
+
+      // Pusher event will sync reactions across all users
+      // Optimistic update already provided instant feedback for current user
+    } catch (err) {
+      console.error('Failed to add reaction:', err)
+
+      // Rollback on failure - refetch the message
+      try {
+        const response = await fetch(`/api/messages/private?chatId=${chatId}&limit=1`)
+        if (response.ok) {
+          const data = await response.json()
+          const updatedMessage = data.messages.find((m: Message) => m.id === messageId)
+          if (updatedMessage) {
+            setMessages(prev => prev.map(msg =>
+              msg.id === messageId ? updatedMessage : msg
+            ))
+          }
+        }
+      } catch (rollbackError) {
+        console.error('Failed to rollback reaction:', rollbackError)
+      }
+    }
+  }
+
+  return {
+    messages,
+    loading: isInitialLoading, // For backward compatibility
+    isInitialLoading,
+    isFetching,
+    error,
+    sendMessage,
+    retryMessage,
+    cancelMessage,
+    markMessageAsRead,
+    editMessage,
+    deleteMessage,
+    sendTypingStart,
+    sendTypingStop,
+    typingUsers,
+    addReaction
+  }
+}
